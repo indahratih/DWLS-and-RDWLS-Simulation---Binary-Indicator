@@ -1,0 +1,188 @@
+suppressPackageStartupMessages({
+  library(MASS)     # ginv
+  library(polycor)  # polychor
+  library(Matrix)   # opsional for matrix utility
+})
+
+## ---------- general utility ----------------
+clamp <- function(x, lo, hi) pmax(lo, pmin(hi, x))
+vec_upper <- function(M) M[upper.tri(M, diag = FALSE)]
+upper_pairs <- function(p) which(upper.tri(matrix(NA, p, p)), arr.ind = TRUE)
+
+## matrix square-root simetris
+mat_sqrt <- function(A) {
+  A <- as.matrix(A); ev <- eigen((A + t(A))/2, symmetric = TRUE)
+  V <- ev$vectors; d <- pmax(ev$values, 0)
+  V %*% diag(sqrt(d), nrow = length(d)) %*% t(V)
+}
+
+##  step 1: threshold estimate
+# Biner: tau_j = qnorm(1 - pi_j)
+estimate_thresholds <- function(y) {
+  p <- ncol(y)
+  taus <- numeric(p)
+  for (j in 1:p) {
+    x <- y[, j]
+    pi1 <- mean(x == max(x))
+    taus[j] <- qnorm(1 - clamp(pi1, 1e-8, 1 - 1e-8))
+  }
+  taus
+}
+
+##  step 2: tetrachoric estimate 
+polychor_safe <- function(x, y, maxcor = 0.98) {
+  x <- ordered(x, levels = c(0,1)); y <- ordered(y, levels = c(0,1))
+  tab <- table(x, y)
+  if (any(tab == 0L)) tab <- tab + 0.5
+  out <- suppressWarnings(try(polycor::polychor(tab, ML = TRUE, std.err = FALSE,
+                                                maxcor = maxcor), silent = TRUE))
+  if (inherits(out, "try-error") || !is.finite(out)) {
+    out <- suppressWarnings(polycor::polychor(tab, ML = FALSE, std.err = FALSE,
+                                              maxcor = maxcor))
+  }
+  as.numeric(max(min(out,  maxcor), -maxcor))
+}
+
+polychor_matrix <- function(df_ord, maxcor = 0.98) {
+  p <- ncol(df_ord)
+  R <- diag(1, p)
+  for (i in 1:(p-1)) for (j in (i+1):p) {
+    R[i, j] <- R[j, i] <- polychor_safe(df_ord[[i]], df_ord[[j]], maxcor)
+  }
+  R
+}
+
+## step 3: covarians vector correlation (Γ̂) via bootstrap
+acm_s_boot <- function(y, B = 500, seed = 1L, maxcor = 0.98) {
+  set.seed(seed)
+  n <- nrow(y); 
+  p <- ncol(y); 
+  q <- p*(p-1)/2
+  s_mat <- matrix(NA_real_, B, q)
+  for (b in 1:B) {
+    idx <- sample.int(n, n, replace = TRUE)
+    yb <- as.data.frame(y[idx, , drop = FALSE])
+    for (j in 1:p) {
+      v <- as.integer(yb[[j]])
+      if (length(unique(v)) < 2L) {        
+        i1 <- sample.int(n, 1); v[i1] <- 1L - v[i1]
+      }
+      yb[[j]] <- ordered(v, levels = c(0,1))
+    }
+    Rb <- suppressWarnings(polychor_matrix(yb, maxcor = maxcor))
+    s_mat[b, ] <- vec_upper(Rb)
+  }
+  cov(s_mat, use = "pairwise.complete.obs")
+}
+
+## step 4: Bobot DWLS diagonal 
+W_diag <- function(Gamma_hat) {
+  diag(1 / pmax(diag(Gamma_hat), 1e-12))
+}
+
+## step 5: Model 1-faktor (diag=1)
+sigma_onefactor <- function(lambda) vec_upper(tcrossprod(lambda))
+
+## step 6: Minimasi FDWLS via Gauss–Newton
+fit_dwls_onefactor <- function(s, W, p, lambda_start = NULL,
+                               max_iter = 200, tol = 1e-8, verbose = FALSE) {
+  q <- length(s); 
+  stopifnot(q == p*(p-1)/2)
+  Uidx <- upper_pairs(p)
+  lambda <- if (is.null(lambda_start)) rep(0.6, p) else lambda_start
+  
+  for (it in 1:max_iter) {
+    mu <- sigma_onefactor(lambda)
+    r  <- s - mu
+    J <- matrix(0, q, p)
+    for (i in 1:q) {
+      j <- Uidx[i,1]; k <- Uidx[i,2]
+      J[i, j] <- lambda[k]; J[i, k] <- lambda[j]
+    }
+    A <- crossprod(J, W %*% J)            # J' W J
+    g <- crossprod(J, W %*% r)            # J' W r
+    step <- try(solve(A, g), silent = TRUE)
+    if (inherits(step, "try-error")) step <- MASS::ginv(A) %*% g
+    lambda_new <- as.numeric(lambda + step)
+    if (sum(lambda_new) < 0) lambda_new <- -lambda_new
+    if (max(abs(lambda_new - lambda)) < tol) { lambda <- lambda_new; break }
+    lambda <- lambda_new
+    if (verbose) cat("iter", it, "F =", drop(crossprod(r, W %*% r)), "\n")
+  }
+  
+  mu_hat <- sigma_onefactor(lambda)
+  list(lambda = lambda, J = J, resid = s - mu_hat,
+       T_DWLS = drop(crossprod(s - mu_hat, W %*% (s - mu_hat))))
+}
+
+## step 7: df
+df_from <- function(p, t) p*(p-1)/2 - t
+
+## step 8: Robust SE (sandwich)
+robust_vcov <- function(J, W, Gamma_hat) {
+  A <- crossprod(J, W %*% J)
+  Ainv <- try(solve(A), silent = TRUE)
+  if (inherits(Ainv, "try-error")) Ainv <- MASS::ginv(A)
+  M <- crossprod(J, W %*% (Gamma_hat %*% (W %*% J)))
+  Ainv %*% M %*% Ainv
+}
+
+## ============= robust dwls ==========
+
+## step 9: SB scaling (c-hat)
+sb_scaling <- function(J, W, Gamma_hat, df) {
+  q <- nrow(W)
+  if (ncol(J) == 0) {
+      return(list(c = 0))
+  }
+  A <- crossprod(J, W %*% J)
+  Ainv <- try(solve(A), silent = TRUE)
+  if (inherits(Ainv, "try-error")) Ainv <- MASS::ginv(A)
+  P  <- J %*% Ainv %*% t(J) %*% W                  
+  W12 <- mat_sqrt(W)
+  U  <- W12 %*% P %*% W12
+  c  <- as.numeric(sum(diag(U %*% Gamma_hat)) / df)
+  list(c = c)
+}
+
+## step 10: Model null (independence) utk CFI
+null_model_stats <- function(s, Gamma_hat, df0) {
+  W0  <- W_diag(Gamma_hat)
+  T0  <- drop(crossprod(s, W0 %*% s))             
+  c0  <- as.numeric(sum(diag(W0 %*% Gamma_hat)) / df0)
+  list(T0_DWLS = T0, c0 = c0)
+}
+
+## step 11: Indeks robust
+cfi_robust <- function(T_sb, df, T0_sb, df0) {
+  num <- max(T_sb - df, 0)
+  den <- max(T0_sb - df0, 0)
+  if (den == 0) return(NA_real_)
+  1 - num/den
+}
+
+#rmsea_robust <- function(T_SB, df, n) {
+ # sqrt(max((T_SB - df),0)/(df * (n - 1)))
+#}
+
+## =============== non robust ==============
+
+null_model_stats1 <- function(s, Gamma_hat, df0) {
+  W0  <- W_diag(Gamma_hat)
+  T0  <- drop(crossprod(s, W0 %*% s))              # sigma0 = 0
+  #c0  <- as.numeric(sum(diag(W0 %*% Gamma_hat)) / df0)
+  list(T0_DWLS = T0)}
+       #, c0 = c0
+       
+cfi_nonrobust <- function(T_sb, df, T0, df0) {
+         num <- max(T_sb - df, 0)
+         den <- max(T0 - df0, 0)
+         if (den == 0) return(NA_real_)
+         1 - num/den
+       }
+vcov_dwls_nonrobust <- function(J, W) {
+  A <- crossprod(J, W %*% J)                # A = J' W J
+  Ainv <- try(solve(A), silent = TRUE)
+  if (inherits(Ainv, "try-error")) Ainv <- MASS::ginv(A)
+  Ainv                                      
+}
