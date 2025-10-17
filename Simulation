@@ -1,0 +1,159 @@
+## ===== balanced condition ============
+
+run_once <- function(seed = 123,
+                     n = 100,
+                     lambda_true = c(0.8, 1, 0.75, 0.6, 0.7, 0.65),
+                     B_boot = 100,      
+                     verbose_fit = FALSE) {
+  set.seed(seed)
+  p <- length(lambda_true)
+  psi_true <- pmax(0, 1 - lambda_true^2)
+
+
+  ## ========== generate Y* one factor ==============
+  eta <- rnorm(n)
+  E   <- sweep(matrix(rnorm(n*p), n, p), 2, sqrt(psi_true), `*`)
+  Y_star <- sweep(matrix(eta, n, p), 2, lambda_true, `*`) + E
+
+
+  ## --- Threshold simulasi & binarisasi ---
+  
+tau_vec <- apply(Y_star, 2, median, na.rm = TRUE)
+  jitter_eps <- rnorm(n * p, 0, 1e-6)  
+  
+  Y_bin <- sapply(seq_len(p), function(j) {
+    as.integer(Y_star[, j] + jitter_eps[(1:n) + (j-1L)*n] > tau_vec[j])
+  }, simplify = TRUE)
+  Y_bin <- matrix(Y_bin, nrow = n, ncol = p)
+  storage.mode(Y_bin) <- "integer"
+
+##--------- constant colom or duplicate =========
+  fix_bin_matrix <- function(M) {
+    M <- as.matrix(M)
+    n <- nrow(M); p <- ncol(M)
+    if (is.null(n) || is.null(p) || n == 0L || p == 0L) return(M)
+
+# constant colom
+    for (jj in seq_len(p)) {
+      v <- M[, jj]
+      if (length(unique(v)) < 2L) {
+        ii <- sample.int(n, 1L)
+        M[ii, jj] <- 1L - M[ii, jj]
+      }
+    }
+    
+  # duplicate colom 
+    if (p >= 2L) {
+      dup_log <- duplicated(as.data.frame(M), MARGIN = 2)  # panjang = p
+      dup_idx <- which(dup_log)
+      if (length(dup_idx)) {
+        for (jj in dup_idx) {
+          if (!is.na(jj) && jj >= 1L && jj <= ncol(M)) {   # guard indeks
+            ii <- sample.int(n, 1L)
+            M[ii, jj] <- 1L - M[ii, jj]
+          }
+        }
+      }
+    }
+    M
+  }
+  Y_bin <- fix_bin_matrix(Y_bin)
+
+# save Y as ordinal
+  Y <- as.data.frame(Y_bin)
+  Y_ord<- as.data.frame(Y)
+  for (j in seq_len(ncol(Y_ord))) {
+    Y_ord[[j]] <- ordered(Y_ord[[j]], levels = c(0,1))
+  }
+  
+  proporsi_1 <- colMeans(Y_bin)
+  tau_hat <- qnorm(1 - clamp(proporsi_1, 1e-8, 1 - 1e-8))  
+  tau_true <- tau_vec                                        
+  
+  R_hat     <- polychor_matrix(Y_ord)
+  s         <- vec_upper(R_hat)
+  Gamma_hat <- acm_s_boot(Y_ord, B = B_boot, seed = seed + 100)
+
+
+  ## --- Bobot DWLS
+  
+  W <- W_diag(Gamma_hat)
+  
+  ## --- Fit one factor DWLS ---
+  fit <- fit_dwls_onefactor(s, W, p, lambda_start = rep(0.6, p),
+                            max_iter = 500, tol = 1e-10, verbose = verbose_fit)
+  
+  lambda_hat <- fit$lambda
+  J_hat      <- fit$J
+  T_DWLS     <- fit$T_DWLS
+  t_par = 2*p
+  #t_par      <- length(lambda_hat)
+  df         <- df_from(p, t_par)
+  
+  ## --- Robust SE & SB scaling ---
+  Vrob  <- robust_vcov(J_hat, W, Gamma_hat)
+  SErob <- sqrt(diag(Vrob))
+  c_SB  <- sb_scaling(J_hat, W, Gamma_hat, df)$c
+  T_SB  <- T_DWLS / c_SB
+  
+  ## --- Null model utk CFI ---
+  df0 <- p*(p-1)/2
+  null <- null_model_stats(s, Gamma_hat, df0)
+  T0_SB <- null$T0_DWLS / null$c0
+  
+  CFI_rob   <- cfi_robust(T_SB, df, T0_SB, df0)
+  #RMSEA_rob <- rmsea_robust(T_SB, df, N = n)
+  
+  
+  ## ================= SE dan CFI non Robust
+  V  <- vcov_dwls_nonrobust(J_hat, W)
+  SE <- sqrt(diag(V))
+  
+  T_sb   <- T_DWLS 
+  df0 <- p*(p-1)/2
+  null1 <- null_model_stats1(s, Gamma_hat, df0)
+  T0 <- null1$T0_DWLS 
+  
+  CFI   <- cfi_nonrobust(T_sb, df, T0, df0)
+  
+    list(
+    seed = seed,
+    lambda_hat = lambda_hat,
+    SErob = SErob,
+    df = df,
+    T_DWLS = T_DWLS,
+    c_SB = c_SB,
+    T_SB = T_SB,
+    CFI_rob = CFI_rob,
+    SE = SE,
+    CFI = CFI,
+    proporsi_1 = proporsi_1,
+    tau_hat    = tau_hat,
+    tau_true   = tau_vec
+  )
+}
+
+
+## =========== unbalaced ===============
+
+
+  mu_j <- colMeans(Y_star)
+  sd_j <- apply(Y_star, 2, sd)
+  tau_vec <- mu_j - k_thresh * sd_j
+  
+## ===== diverse ===============
+#all other commands are the same, the only difference is in
+
+lambda_true = c(0.8, 1, 0.75, 0.6, 0.7, 0.65)
+pi_vec <- c(0.39, 0.87, 0.34, 0.35, 0.25, 0.45) 
+tau_from_pi <- function(pi) 
+qnorm(1 - clamp(pi, 1e-8, 1-1e-8))  
+tau_vec <- sapply(pi_vec, tau_from_pi) 
+
+
+  
+    
+ 
+  
+  
+ 
